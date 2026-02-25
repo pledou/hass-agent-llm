@@ -88,6 +88,9 @@ REINDEX_DEBOUNCE_DELAY = 2.0
 # Maximum concurrent reindex operations
 MAX_CONCURRENT_REINDEX = 3
 
+# Minimum delay between two reindex operations for the same entity (seconds)
+DEFAULT_MIN_REINDEX_INTERVAL_SECONDS = 30.0
+
 
 class VectorDBManager:
     """Manages entity embeddings in ChromaDB."""
@@ -143,6 +146,10 @@ class VectorDBManager:
         self._reindex_task: asyncio.Task[None] | None = None
         self._reindex_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REINDEX)
         self._initial_index_task: asyncio.Task[dict[str, Any]] | None = None
+        self._last_indexed_at: dict[str, float] = {}
+        self._min_reindex_interval_seconds = float(
+            config.get("vector_db_min_reindex_interval_seconds", DEFAULT_MIN_REINDEX_INTERVAL_SECONDS)
+        )
 
         _LOGGER.info(
             "Vector DB Manager initialized (host=%s:%s, collection=%s)",
@@ -413,8 +420,25 @@ class VectorDBManager:
         if not entity_id or self._should_skip_entity(entity_id):
             return
 
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+
+        # Skip reindex when textual state did not change.
+        # This avoids unnecessary embedding work for metadata-only updates.
+        if isinstance(old_state, State) and isinstance(new_state, State):
+            if old_state.state == new_state.state:
+                return
+
+        now = asyncio.get_event_loop().time()
+        last_indexed_at = self._last_indexed_at.get(entity_id)
+        if (
+            last_indexed_at is not None
+            and (now - last_indexed_at) < self._min_reindex_interval_seconds
+        ):
+            return
+
         # Record pending reindex (deduplicates rapid changes for same entity)
-        self._pending_reindex[entity_id] = asyncio.get_event_loop().time()
+        self._pending_reindex[entity_id] = now
 
         # Schedule debounced batch reindex if not already scheduled
         if self._reindex_task is None or self._reindex_task.done():
@@ -439,6 +463,7 @@ class VectorDBManager:
             async with self._reindex_semaphore:
                 try:
                     await self.async_index_entity(entity_id)
+                    self._last_indexed_at[entity_id] = asyncio.get_event_loop().time()
                 except Exception as err:
                     _LOGGER.debug(
                         "Failed to reindex entity %s after state change: %s",
