@@ -88,8 +88,11 @@ REINDEX_DEBOUNCE_DELAY = 2.0
 # Maximum concurrent reindex operations
 MAX_CONCURRENT_REINDEX = 3
 
-# Minimum delay between two reindex operations for the same entity (seconds)
-DEFAULT_MIN_REINDEX_INTERVAL_SECONDS = 30.0
+# Warn if an exposed entity changes more often than once per minute
+HIGH_REFRESH_RATE_THRESHOLD_SECONDS = 60.0
+
+# Avoid warning spam for the same entity
+HIGH_REFRESH_WARNING_COOLDOWN_SECONDS = 600.0
 
 
 class VectorDBManager:
@@ -146,10 +149,8 @@ class VectorDBManager:
         self._reindex_task: asyncio.Task[None] | None = None
         self._reindex_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REINDEX)
         self._initial_index_task: asyncio.Task[dict[str, Any]] | None = None
-        self._last_indexed_at: dict[str, float] = {}
-        self._min_reindex_interval_seconds = float(
-            config.get("vector_db_min_reindex_interval_seconds", DEFAULT_MIN_REINDEX_INTERVAL_SECONDS)
-        )
+        self._last_state_changed_at: dict[str, float] = {}
+        self._last_high_refresh_warning_at: dict[str, float] = {}
 
         _LOGGER.info(
             "Vector DB Manager initialized (host=%s:%s, collection=%s)",
@@ -430,12 +431,26 @@ class VectorDBManager:
                 return
 
         now = asyncio.get_event_loop().time()
-        last_indexed_at = self._last_indexed_at.get(entity_id)
-        if (
-            last_indexed_at is not None
-            and (now - last_indexed_at) < self._min_reindex_interval_seconds
-        ):
-            return
+
+        # Warn when an exposed entity updates too frequently (more than once per minute)
+        previous_state_change = self._last_state_changed_at.get(entity_id)
+        self._last_state_changed_at[entity_id] = now
+        if previous_state_change is not None:
+            state_change_interval = now - previous_state_change
+            if state_change_interval < HIGH_REFRESH_RATE_THRESHOLD_SECONDS:
+                previous_warning = self._last_high_refresh_warning_at.get(entity_id)
+                if (
+                    previous_warning is None
+                    or (now - previous_warning) >= HIGH_REFRESH_WARNING_COOLDOWN_SECONDS
+                ):
+                    self._last_high_refresh_warning_at[entity_id] = now
+                    _LOGGER.warning(
+                        "Entity %s is exposed to Assist and updates very frequently (%.1fs). "
+                        "This can increase embedding churn and latency. "
+                        "Consider unexposing it or reducing update frequency.",
+                        entity_id,
+                        state_change_interval,
+                    )
 
         # Record pending reindex (deduplicates rapid changes for same entity)
         self._pending_reindex[entity_id] = now
@@ -463,7 +478,6 @@ class VectorDBManager:
             async with self._reindex_semaphore:
                 try:
                     await self.async_index_entity(entity_id)
-                    self._last_indexed_at[entity_id] = asyncio.get_event_loop().time()
                 except Exception as err:
                     _LOGGER.debug(
                         "Failed to reindex entity %s after state change: %s",
