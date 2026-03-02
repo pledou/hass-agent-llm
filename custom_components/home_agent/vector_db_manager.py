@@ -336,20 +336,7 @@ class VectorDBManager:
                 "friendly_name": state.attributes.get("friendly_name", entity_id),
             }
 
-            # Add to collection
-            # Type narrowing assertion for mypy
-            assert self._collection is not None
-            collection = self._collection
-            # Cast to list[Sequence[float]] to satisfy chromadb's type signature
-            embeddings = cast(list[Sequence[float]], [embedding])
-            await self.hass.async_add_executor_job(
-                lambda: collection.upsert(
-                    ids=[entity_id],
-                    embeddings=embeddings,
-                    metadatas=[metadata],
-                    documents=[text],
-                )
-            )
+            await self._async_upsert_entity(entity_id, embedding, metadata, text)
 
             _LOGGER.debug("Indexed entity: %s", entity_id)
 
@@ -371,10 +358,7 @@ class VectorDBManager:
         try:
             await self._ensure_initialized()
 
-            # Type narrowing assertion for mypy
-            assert self._collection is not None
-            collection = self._collection
-            await self.hass.async_add_executor_job(lambda: collection.delete(ids=[entity_id]))
+            await self._async_delete_entity(entity_id)
 
             _LOGGER.debug("Removed entity from index: %s", entity_id)
 
@@ -498,11 +482,7 @@ class VectorDBManager:
         try:
             _LOGGER.debug("Running vector DB maintenance")
 
-            # Get all indexed entity IDs
-            # Type narrowing assertion for mypy
-            assert self._collection is not None
-            collection = self._collection
-            result = await self.hass.async_add_executor_job(lambda: collection.get())
+            result = await self._async_get_collection_items()
 
             if not result or "ids" not in result:
                 return
@@ -520,6 +500,100 @@ class VectorDBManager:
 
         except Exception as err:
             _LOGGER.warning("Maintenance task failed: %s", err)
+
+    @staticmethod
+    def _is_missing_collection_error(err: Exception) -> bool:
+        """Return True when ChromaDB reports a missing collection."""
+        err_name = err.__class__.__name__
+        err_msg = str(err)
+        return (
+            err_name == "NotFoundError"
+            and "Collection [" in err_msg
+            and "does not exist" in err_msg
+        )
+
+    async def _async_refresh_collection(self) -> None:
+        """Refresh cached collection handle from ChromaDB."""
+        self._collection = None
+        await self._ensure_initialized()
+
+    async def _async_upsert_entity(
+        self,
+        entity_id: str,
+        embedding: list[float],
+        metadata: dict[str, Any],
+        text: str,
+    ) -> None:
+        """Upsert an entity embedding, refreshing stale collection handles once."""
+        assert self._collection is not None
+        collection = self._collection
+        embeddings = cast(list[Sequence[float]], [embedding])
+
+        try:
+            await self.hass.async_add_executor_job(
+                lambda: collection.upsert(
+                    ids=[entity_id],
+                    embeddings=embeddings,
+                    metadatas=[metadata],
+                    documents=[text],
+                )
+            )
+        except Exception as err:
+            if not self._is_missing_collection_error(err):
+                raise
+
+            _LOGGER.warning(
+                "Detected stale ChromaDB collection handle during upsert; refreshing and retrying"
+            )
+            await self._async_refresh_collection()
+            assert self._collection is not None
+            collection = self._collection
+            await self.hass.async_add_executor_job(
+                lambda: collection.upsert(
+                    ids=[entity_id],
+                    embeddings=embeddings,
+                    metadatas=[metadata],
+                    documents=[text],
+                )
+            )
+
+    async def _async_delete_entity(self, entity_id: str) -> None:
+        """Delete an entity embedding, refreshing stale collection handles once."""
+        assert self._collection is not None
+        collection = self._collection
+
+        try:
+            await self.hass.async_add_executor_job(lambda: collection.delete(ids=[entity_id]))
+        except Exception as err:
+            if not self._is_missing_collection_error(err):
+                raise
+
+            _LOGGER.warning(
+                "Detected stale ChromaDB collection handle during delete; refreshing and retrying"
+            )
+            await self._async_refresh_collection()
+            assert self._collection is not None
+            collection = self._collection
+            await self.hass.async_add_executor_job(lambda: collection.delete(ids=[entity_id]))
+
+    async def _async_get_collection_items(self) -> Any:
+        """Get collection contents, refreshing stale collection handles once."""
+        assert self._collection is not None
+        collection = self._collection
+
+        try:
+            return await self.hass.async_add_executor_job(lambda: collection.get())
+        except Exception as err:
+            if not self._is_missing_collection_error(err):
+                raise
+
+            _LOGGER.warning(
+                "Detected stale ChromaDB collection handle during get; refreshing and retrying"
+            )
+            await self._async_refresh_collection()
+            assert self._collection is not None
+            collection = self._collection
+            return await self.hass.async_add_executor_job(lambda: collection.get())
 
     def _should_skip_entity(self, entity_id: str) -> bool:
         """Determine if an entity should be skipped during indexing.
